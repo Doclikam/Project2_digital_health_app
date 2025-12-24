@@ -1,354 +1,342 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px 
 import numpy as np
 import hashlib
-import requests
+from datetime import timedelta
+from scipy.stats import linregress
 from sklearn.ensemble import IsolationForest
+import plotly.express as px
 
-#===============
-#app config
-#===============
-
+# =====================================================
+# STREAMLIT CONFIG
+# =====================================================
 st.set_page_config(
-    page_title="Clinical Digital Health Dashboard",
+    page_title="Clinical Alert Dashboard",
     layout="wide"
 )
 
-st.title("🩺 Clinical Digital Health Monitoring Dashboard")
-st.markdown("""
-**Early risk detection for shock/sepsis, hypertensive emergencies, and hyperglycemia**  
-*IoT sensors monitors
-""")
+st.title("🩺 Mini - Clinical Digital Health Alert Dashboard")
+st.caption("Severity-based, trend-aware medical risk monitoring")
 
-# =========================
-# LOAD & PREPROCESS DATA
-# =========================
+# =====================================================
+# LOAD DATA
+# =====================================================
 @st.cache_data
-def load_and_preprocess(path):
+def load_data(path):
     df = pd.read_csv(path)
 
-    # Normalize columns
-    df.columns = df.columns.str.lower().str.strip().str.replace(" ", "_")
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+    )
 
-    # Timestamp
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.sort_values("timestamp")
 
-    # Patients Privacy - Anonymization
+    # Hash patient ID, keep device_id
     df["patient_id_hash"] = df["patient_id"].astype(str).apply(
         lambda x: hashlib.sha256(x.encode()).hexdigest()
     )
     df = df.drop(columns=["patient_id"])
 
     df = df.set_index("timestamp")
-
-    # Selective interpolation
-    interp_cols = ["heart_rate", "respiratory_rate", "body_temperature"]
-    df[interp_cols] = df[interp_cols].interpolate(method="time", limit=2)
-
-    # Measurement density
-    df["hr_count_30min"] = df["heart_rate"].notna().rolling("30min").sum()
-    df["hr_reliable"] = df["hr_count_30min"] >= 3
-
-    # Rolling HR
-    df["hr_rolling_30min"] = df["heart_rate"].rolling("30min").mean()
-    df.loc[~df["hr_reliable"], "hr_rolling_30min"] = np.nan
-
     return df
 
-df = load_and_preprocess("data/iot_health_monitoring_dataset.csv")
 
+df = load_data("data/iot_health_monitoring_dataset.csv")
 
-@st.cache_data(ttl=3600)
-def fetch_fhir_glucose_labs():
-    FHIR_BASE = "https://hapi.fhir.org/baseR4"
-    params = {
-        "code": "15074-8",   # LOINC: Glucose
-        "_count": 10
-    }
+# =====================================================
+# PREPROCESSING & RELIABILITY
+# =====================================================
+INTERPOLATE_COLS = ["heart_rate", "respiratory_rate", "body_temperature"]
 
-    try:
-        r = requests.get(f"{FHIR_BASE}/Observation", params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+df[INTERPOLATE_COLS] = df[INTERPOLATE_COLS].interpolate(
+    method="time", limit=2
+)
 
-        labs = []
-        for entry in data.get("entry", []):
-            obs = entry["resource"]
-            if "valueQuantity" in obs and "effectiveDateTime" in obs:
-                labs.append({
-                    "timestamp": obs["effectiveDateTime"],
-                    "lab_glucose": obs["valueQuantity"]["value"]
-                })
+df["hr_count_30min"] = df["heart_rate"].notna().rolling("30min").sum()
+df["hr_reliable"] = df["hr_count_30min"] >= 3
 
-        df_labs = pd.DataFrame(labs)
-        df_labs["timestamp"] = pd.to_datetime(df_labs["timestamp"])
-        return df_labs.sort_values("timestamp")
-
-    except Exception as e:
-        return pd.DataFrame()
-
-
-# =========================
-# HR ANOMALY FEATURE
-# =========================
+# =====================================================
+# ML: HR ANOMALY (SUPPORTING SIGNAL ONLY)
+# =====================================================
 df_ml = df.reset_index().copy()
 df_ml["row_id"] = df_ml.index
 
-features = df_ml[["row_id", "heart_rate", "activity_level", "hrv_sdnn"]].dropna()
+ml_features = df_ml[
+    ["row_id", "heart_rate", "activity_level", "hrv_sdnn"]
+].dropna()
 
 iso = IsolationForest(contamination=0.05, random_state=42)
-features["hr_anomaly"] = iso.fit_predict(
-    features[["heart_rate", "activity_level", "hrv_sdnn"]]
+ml_features["hr_anomaly"] = iso.fit_predict(
+    ml_features[["heart_rate", "activity_level", "hrv_sdnn"]]
 )
 
 df_ml = df_ml.merge(
-    features[["row_id", "hr_anomaly"]],
+    ml_features[["row_id", "hr_anomaly"]],
     on="row_id",
     how="left"
 )
 
 df = df_ml.drop(columns="row_id").set_index("timestamp")
 
-# =========================================================================
-# CLINICAL RISK LOGIC:SEPSIS, HYPERTENSIVE EMERGENCY, HYPERG/HYPOGLYCEMIA
-# =========================================================================
-df["shock_sepsis_risk"] = (
-    (df["heart_rate"] > 90) & (df["respiratory_rate"] > 20) & (df['body_temperature'] > 100.4) |
-    (df["hr_anomaly"] == -1)
+# =====================================================
+# CLINICAL SCORING FUNCTIONS
+# =====================================================
+def sepsis_score(row):
+    score = 0
+    reasons = []
+
+    if row["heart_rate"] > 100:
+        score += 1; reasons.append("Tachycardia")
+    if row["respiratory_rate"] > 22:
+        score += 1; reasons.append("Tachypnea")
+    if row["body_temperature"] > 100.4:
+        score += 1; reasons.append("Fever")
+    if row.get("hr_anomaly") == -1:
+        score += 1; reasons.append("HR anomaly")
+
+    return score, reasons
+
+
+def stratify(score):
+    if score >= 3:
+        return "HIGH"
+    if score == 2:
+        return "MEDIUM"
+    if score == 1:
+        return "LOW"
+    return "NONE"
+
+
+def hypertension_severity(row):
+    sbp = row["blood_pressure_systolic"]
+    dbp = row["blood_pressure_diastolic"]
+
+    if sbp >= 180 or dbp >= 120:
+        return "EMERGENCY", ["Severely elevated BP"]
+    elif sbp >= 140 or dbp >= 90:
+        return "STAGE_2", ["Stage 2 hypertension"]
+    elif sbp >= 130 or dbp >= 80:
+        return "STAGE_1", ["Stage 1 hypertension"]
+    else:
+        return "NORMAL", []
+
+
+def glycemic_risk(row):
+    g = row["glucose_level"]
+
+    if g < 70:
+        return "HYPOGLYCEMIA", ["Low glucose"]
+    elif g >= 250:
+        return "SEVERE_HYPERGLYCEMIA", ["Severely elevated glucose"]
+    elif g >= 180:
+        return "HYPERGLYCEMIA", ["Elevated glucose"]
+    else:
+        return "NORMAL", []
+
+
+# =====================================================
+# APPLY CLINICAL LOGIC
+# =====================================================
+df[["sepsis_score", "sepsis_reasons"]] = df.apply(
+    lambda r: pd.Series(sepsis_score(r)), axis=1
+)
+df["sepsis_severity"] = df["sepsis_score"].apply(stratify)
+
+df[["htn_severity", "htn_reasons"]] = df.apply(
+    lambda r: pd.Series(hypertension_severity(r)), axis=1
 )
 
-df["htn_emergency_risk"] = (
-    (df["blood_pressure_systolic"] >= 180) |
-    (df["blood_pressure_diastolic"] >= 120)
+df[["glycemic_severity", "glycemic_reasons"]] = df.apply(
+    lambda r: pd.Series(glycemic_risk(r)), axis=1
 )
 
-df["hyperglycemia"] = df["glucose_level"] >= 180
-df["severe_hyperglycemia"] = df["glucose_level"] >= 250
+# =====================================================
+# TREND-BASED WORSENING (PATIENT-LEVEL)
+# =====================================================
+def rolling_slope(series, window="30min"):
+    slopes = []
+    for i in range(len(series)):
+        window_data = series.iloc[:i+1].last(window)
+        if len(window_data) < 3:
+            slopes.append(np.nan)
+            continue
+        x = np.arange(len(window_data))
+        y = window_data.values
+        slope, _, _, _, _ = linregress(x, y)
+        slopes.append(slope)
+    return slopes
 
 
-st.subheader("🚨 Patients Requiring Attention")
+df["hr_trend"] = (
+    df.groupby("patient_id_hash", group_keys=False)["heart_rate"]
+    .apply(rolling_slope)
+)
 
-if alert_events.empty:
-    st.success("No active high-risk patients.")
+df["sbp_trend"] = (
+    df.groupby("patient_id_hash", group_keys=False)["blood_pressure_systolic"]
+    .apply(rolling_slope)
+)
+
+df["glucose_trend"] = (
+    df.groupby("patient_id_hash", group_keys=False)["glucose_level"]
+    .apply(rolling_slope)
+)
+
+def worsening_flags(row):
+    flags = []
+    if pd.notna(row["hr_trend"]) and row["hr_trend"] > 0.5:
+        flags.append("Heart rate rising")
+    if pd.notna(row["sbp_trend"]) and row["sbp_trend"] > 0.5:
+        flags.append("Blood pressure rising")
+    if pd.notna(row["glucose_trend"]) and row["glucose_trend"] > 1:
+        flags.append("Glucose rising")
+    return flags
+
+
+df["worsening_flags"] = df.apply(worsening_flags, axis=1)
+df["is_worsening"] = df["worsening_flags"].apply(lambda x: len(x) > 0)
+
+# Escalation
+df["sepsis_severity_final"] = df["sepsis_severity"]
+df.loc[
+    (df["sepsis_severity"] == "MEDIUM") & (df["is_worsening"]),
+    "sepsis_severity_final"
+] = "HIGH"
+
+df["htn_severity_final"] = df["htn_severity"]
+df.loc[
+    (df["htn_severity"] == "STAGE_2") & (df["is_worsening"]),
+    "htn_severity_final"
+] = "EMERGENCY"
+
+# =====================================================
+# ALERT EVENT GENERATION (WITH COOLDOWN)
+# =====================================================
+ALERT_COOLDOWN = timedelta(minutes=30)
+alert_events = []
+last_alert_time = {}
+
+for ts, row in df.iterrows():
+    patient = row["patient_id_hash"]
+    device = row["device_id"]
+
+    # SEPSIS
+    if row["sepsis_severity_final"] in ["HIGH", "MEDIUM"] and row["hr_reliable"]:
+        key = (patient, "SEPSIS")
+        if key not in last_alert_time or ts - last_alert_time[key] > ALERT_COOLDOWN:
+            reasons = row["sepsis_reasons"] + row["worsening_flags"]
+            alert_events.append({
+                "timestamp": ts,
+                "patient_id_hash": patient,
+                "device_id": device,
+                "alert_type": "Shock / Sepsis",
+                "severity": row["sepsis_severity_final"],
+                "reason": ", ".join(reasons)
+            })
+            last_alert_time[key] = ts
+
+    # HYPERTENSION
+    if row["htn_severity_final"] in ["STAGE_2", "EMERGENCY"]:
+        key = (patient, "HTN")
+        if key not in last_alert_time or ts - last_alert_time[key] > ALERT_COOLDOWN:
+            reasons = row["htn_reasons"] + row["worsening_flags"]
+            alert_events.append({
+                "timestamp": ts,
+                "patient_id_hash": patient,
+                "device_id": device,
+                "alert_type": "Hypertension",
+                "severity": row["htn_severity_final"],
+                "reason": ", ".join(reasons)
+            })
+            last_alert_time[key] = ts
+
+    # GLYCEMIC
+    if row["glycemic_severity"] in ["HYPOGLYCEMIA", "SEVERE_HYPERGLYCEMIA"]:
+        key = (patient, "GLUCOSE")
+        if key not in last_alert_time or ts - last_alert_time[key] > ALERT_COOLDOWN:
+            alert_events.append({
+                "timestamp": ts,
+                "patient_id_hash": patient,
+                "device_id": device,
+                "alert_type": "Glycemic Emergency",
+                "severity": row["glycemic_severity"],
+                "reason": ", ".join(row["glycemic_reasons"])
+            })
+            last_alert_time[key] = ts
+
+alerts_df = pd.DataFrame(alert_events)
+
+# =====================================================
+# UI — ACTIVE ALERTS
+# =====================================================
+st.subheader("🚨 Active Clinical Alerts")
+
+if alerts_df.empty:
+    st.success("No active alerts")
 else:
     st.dataframe(
-        alert_events.sort_values("timestamp", ascending=False),
+        alerts_df.sort_values("timestamp", ascending=False),
         use_container_width=True
     )
 
+# =====================================================
+# UI — PATIENT VIEW
+# =====================================================
+st.subheader("👤 Patient Drill-down")
 
-# =========================
-# RISK BADGE FUNCTION
-# =========================
-def badge(level):
-    return {
-        "HIGH": "🔴 HIGH",
-        "MEDIUM": "🟠 MODERATE",
-        "LOW": "🟡 LOW",
-        "NONE": "🟢 NORMAL"
-    }.get(level, "🟢 NORMAL")
+patient_ids = df["patient_id_hash"].unique()
+selected_patient = st.selectbox("Select patient", patient_ids)
 
-st.metric(
-    "Shock / Sepsis Risk",
-    badge(latest["sepsis_level"]),
-    help=latest["sepsis_reason"]
-)
-
-
-# =========================
-# TOP KPIs
-# =========================
-latest = df.iloc[-1]
-
-col1, col2, col3 = st.columns(3)
-
-col1.metric(
-    "Shock / Sepsis Risk",
-    risk_badge(latest["shock_sepsis_risk"])
-)
-
-col2.metric(
-    "Hypertensive Emergency",
-    risk_badge(latest["htn_emergency_risk"])
-)
-
-col3.metric(
-    "Hyperglycemia",
-    "🔴 SEVERE" if latest["severe_hyperglycemia"]
-    else ("🟠 PRESENT" if latest["hyperglycemia"] else "🟢 NORMAL")
-)
-
-# =========================
-# PANEL 1 — SHOCK / SEPSIS
-# =========================
-st.subheader("🔴 Early Shock / Sepsis Risk")
+patient_df = df[df["patient_id_hash"] == selected_patient]
 
 fig = px.line(
-    df.reset_index(),
+    patient_df.reset_index(),
     x="timestamp",
-    y=["heart_rate", "respiratory_rate"],
-    title="Heart Rate & Respiratory Rate"
-)
-st.plotly_chart(fig, use_container_width=True)
-def sepsis_alert(row):
-    reasons = []
-    score = 0
-
-    if row["heart_rate"] > 100:
-        score += 1
-        reasons.append("Tachycardia")
-
-    if row["respiratory_rate"] > 22:
-        score += 1
-        reasons.append("Tachypnea")
-
-    if row["body_temperature"] > 100.4:
-        score += 1
-        reasons.append("Fever")
-
-    if row["hr_anomaly"] == -1:
-        score += 1
-        reasons.append("HR anomaly detected")
-
-    if score >= 3:
-        return "HIGH", ", ".join(reasons)
-    elif score == 2:
-        return "MEDIUM", ", ".join(reasons)
-    elif score == 1:
-        return "LOW", ", ".join(reasons)
-    else:
-        return "NONE", ""
-
-df[["sepsis_level", "sepsis_reason"]] = df.apply(
-    lambda r: pd.Series(sepsis_alert(r)), axis=1
-)
-alert_events = df[
-    df["sepsis_level"].isin(["HIGH", "MEDIUM"])
-][[
-    "patient_id_hash",
-    "sepsis_level",
-    "sepsis_reason"
-]].copy()
-
-alert_events["timestamp"] = df.index
-
-if latest["sepsis_level"] == "HIGH":
-    st.error("🚑 Urgent clinical review recommended. Assess for sepsis.")
-elif latest["sepsis_level"] == "MEDIUM":
-    st.warning("👀 Close monitoring advised. Reassess vitals and trends.")
-
-
-# =========================
-# PANEL 2 — BLOOD PRESSURE
-# =========================
-st.subheader("🔵 Hypertensive Emergency Risk")
-
-fig = px.line(
-    df.reset_index(),
-    x="timestamp",
-    y=["blood_pressure_systolic", "blood_pressure_diastolic"],
-    title="Blood Pressure Trends"
-)
-
-fig.add_hline(y=180, line_dash="dash", line_color="red")
-fig.add_hline(y=120, line_dash="dash", line_color="red")
-
-st.plotly_chart(fig, use_container_width=True)
-
-# =========================
-# PANEL 3 — GLUCOSE
-# =========================
-st.subheader("🟠 Hyperglycemia & Metabolic Risk")
-
-fig = px.line(
-    df.reset_index(),
-    x="timestamp",
-    y="glucose_level",
-    title="Glucose Levels Over Time"
-)
-
-fig.add_hline(y=180, line_dash="dash", line_color="orange")
-fig.add_hline(y=250, line_dash="dash", line_color="red")
-
-st.plotly_chart(fig, use_container_width=True)
-
-
-st.subheader("🧬 Laboratory Glucose (FHIR – Live)")
-
-df_labs = fetch_fhir_glucose_labs()
-
-if df_labs.empty:
-    st.warning("FHIR lab server unavailable or no lab data returned.")
-else:
-    fig = px.line(
-        df_labs,
-        x="timestamp",
-        y="lab_glucose",
-        markers=True,
-        title="FHIR Laboratory Glucose Results",
-        labels={"lab_glucose": "Glucose (mg/dL)"}
-    )
-
-    fig.add_hline(
-        y=126,
-        line_dash="dash",
-        line_color="red",
-        annotation_text="Hyperglycemia threshold"
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.caption(
-        "Laboratory glucose values provide high-confidence reference points and "
-        "are shown alongside wearable trends for clinical context."
-    )
-
-
-# =========================
-# PANEL 4 — CONTEXT
-# =========================
-st.subheader("🟢 Behavioral & Modifiable Factors")
-
-fig = px.scatter(
-    df,
-    x="activity_level",
     y="heart_rate",
-    color="shock_sepsis_risk",
-    title="Heart Rate vs Activity Level"
+    color="sepsis_severity_final",
+    title="Heart Rate with Sepsis Severity",
+    color_discrete_map={
+        "NONE": "green",
+        "LOW": "yellow",
+        "MEDIUM": "orange",
+        "HIGH": "red"
+    }
 )
+
 st.plotly_chart(fig, use_container_width=True)
 
-# =========================
-# PANEL 5 — PATIENT EDUCATION
-# =========================
-st.subheader("📘 Patient Education (Actionable & Modifiable)")
+# =====================================================
+# UI — RISK HEATMAP
+# =====================================================
+risk_df = patient_df.copy()
 
-education = []
+risk_df["Shock / Sepsis"] = risk_df["sepsis_severity_final"].map(
+    {"NONE": 0, "LOW": 0, "MEDIUM": 1, "HIGH": 2}
+)
 
-if latest["sleep_quality"] < 0.3:
-    education.append("Improve sleep consistency — poor sleep increases cardiovascular stress.")
+risk_df["HTN Emergency"] = risk_df["htn_severity_final"].map(
+    {"NORMAL": 0, "STAGE_1": 0, "STAGE_2": 1, "EMERGENCY": 2}
+)
 
-if latest["stress_level"] > 0.7:
-    education.append("Stress reduction (breathing, mindfulness) may help lower heart rate.")
+risk_df["Hyperglycemia"] = risk_df["glycemic_severity"].map(
+    {"NORMAL": 0, "HYPERGLYCEMIA": 1, "SEVERE_HYPERGLYCEMIA": 2, "HYPOGLYCEMIA": 2}
+)
 
-if latest["steps_count"] < 100:
-    education.append("Gradually increase daily physical activity to improve BP and glucose control.")
+risk_df["HR Anomaly"] = (risk_df["hr_anomaly"] == -1).astype(int)
 
-if latest["hyperglycemia"]:
-    education.append("Review diet and medication adherence to improve glucose control.")
+heatmap_df = risk_df[
+    ["Shock / Sepsis", "HTN Emergency", "Hyperglycemia", "HR Anomaly"]
+].T
 
-if not education:
-    education.append("Current lifestyle indicators are supportive of stable health.")
+fig = px.imshow(
+    heatmap_df,
+    aspect="auto",
+    color_continuous_scale=[[0, "green"], [0.5, "orange"], [1, "red"]],
+    title="Clinical Risk Timeline"
+)
 
-for msg in education:
-    st.markdown(f"- {msg}")
-
-# =========================
-# FOOTER
-# =========================
-st.markdown("""
----
-*This dashboard help to detect early signs of clinical deterioration*
-""")
+st.plotly_chart(fig, use_container_width=True)
