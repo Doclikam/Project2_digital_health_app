@@ -84,7 +84,7 @@ df = df_ml.drop(columns="row_id").set_index("timestamp")
 # CLINICAL RISK LOGIC:SEPSIS, HYPERTENSIVE EMERGENCY, HYPERG/HYPOGLYCEMIA
 # =========================================================================
 df["shock_sepsis_risk"] = (
-    (df["heart_rate"] > 90) & (df["respiratory_rate"] > 20) & ('df['body_temperature'] > 100.4) |
+    (df["heart_rate"] > 90) & (df["respiratory_rate"] > 20) & (df['body_temperature'] > 100.4) |
     (df["hr_anomaly"] == -1)
 )
 
