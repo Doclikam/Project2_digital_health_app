@@ -127,13 +127,35 @@ df["htn_emergency_risk"] = (
 df["hyperglycemia"] = df["glucose_level"] >= 180
 df["severe_hyperglycemia"] = df["glucose_level"] >= 250
 
+
+st.subheader("🚨 Patients Requiring Attention")
+
+if alert_events.empty:
+    st.success("No active high-risk patients.")
+else:
+    st.dataframe(
+        alert_events.sort_values("timestamp", ascending=False),
+        use_container_width=True
+    )
+
+
 # =========================
 # RISK BADGE FUNCTION
 # =========================
-def risk_badge(condition):
-    if condition:
-        return "🔴 HIGH"
-    return "🟢 LOW"
+def badge(level):
+    return {
+        "HIGH": "🔴 HIGH",
+        "MEDIUM": "🟠 MODERATE",
+        "LOW": "🟡 LOW",
+        "NONE": "🟢 NORMAL"
+    }.get(level, "🟢 NORMAL")
+
+st.metric(
+    "Shock / Sepsis Risk",
+    badge(latest["sepsis_level"]),
+    help=latest["sepsis_reason"]
+)
+
 
 # =========================
 # TOP KPIs
@@ -170,6 +192,53 @@ fig = px.line(
     title="Heart Rate & Respiratory Rate"
 )
 st.plotly_chart(fig, use_container_width=True)
+def sepsis_alert(row):
+    reasons = []
+    score = 0
+
+    if row["heart_rate"] > 100:
+        score += 1
+        reasons.append("Tachycardia")
+
+    if row["respiratory_rate"] > 22:
+        score += 1
+        reasons.append("Tachypnea")
+
+    if row["body_temperature"] > 100.4:
+        score += 1
+        reasons.append("Fever")
+
+    if row["hr_anomaly"] == -1:
+        score += 1
+        reasons.append("HR anomaly detected")
+
+    if score >= 3:
+        return "HIGH", ", ".join(reasons)
+    elif score == 2:
+        return "MEDIUM", ", ".join(reasons)
+    elif score == 1:
+        return "LOW", ", ".join(reasons)
+    else:
+        return "NONE", ""
+
+df[["sepsis_level", "sepsis_reason"]] = df.apply(
+    lambda r: pd.Series(sepsis_alert(r)), axis=1
+)
+alert_events = df[
+    df["sepsis_level"].isin(["HIGH", "MEDIUM"])
+][[
+    "patient_id_hash",
+    "sepsis_level",
+    "sepsis_reason"
+]].copy()
+
+alert_events["timestamp"] = df.index
+
+if latest["sepsis_level"] == "HIGH":
+    st.error("🚑 Urgent clinical review recommended. Assess for sepsis.")
+elif latest["sepsis_level"] == "MEDIUM":
+    st.warning("👀 Close monitoring advised. Reassess vitals and trends.")
+
 
 # =========================
 # PANEL 2 — BLOOD PRESSURE
