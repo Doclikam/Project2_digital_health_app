@@ -1,5 +1,5 @@
 import streamlit as ts
-import panadas as pd
+import pandas as pd
 import plotly.express as px 
 import numpy as np
 import hashlib
