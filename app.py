@@ -59,6 +59,37 @@ def load_and_preprocess(path):
 
 df = load_and_preprocess("data/iot_health_monitoring_dataset.csv")
 
+
+@st.cache_data(ttl=3600)
+def fetch_fhir_glucose_labs():
+    FHIR_BASE = "https://hapi.fhir.org/baseR4"
+    params = {
+        "code": "15074-8",   # LOINC: Glucose
+        "_count": 10
+    }
+
+    try:
+        r = requests.get(f"{FHIR_BASE}/Observation", params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        labs = []
+        for entry in data.get("entry", []):
+            obs = entry["resource"]
+            if "valueQuantity" in obs and "effectiveDateTime" in obs:
+                labs.append({
+                    "timestamp": obs["effectiveDateTime"],
+                    "lab_glucose": obs["valueQuantity"]["value"]
+                })
+
+        df_labs = pd.DataFrame(labs)
+        df_labs["timestamp"] = pd.to_datetime(df_labs["timestamp"])
+        return df_labs.sort_values("timestamp")
+
+    except Exception as e:
+        return pd.DataFrame()
+
+
 # =========================
 # HR ANOMALY FEATURE
 # =========================
@@ -173,6 +204,38 @@ fig.add_hline(y=180, line_dash="dash", line_color="orange")
 fig.add_hline(y=250, line_dash="dash", line_color="red")
 
 st.plotly_chart(fig, use_container_width=True)
+
+
+st.subheader("🧬 Laboratory Glucose (FHIR – Live)")
+
+df_labs = fetch_fhir_glucose_labs()
+
+if df_labs.empty:
+    st.warning("FHIR lab server unavailable or no lab data returned.")
+else:
+    fig = px.line(
+        df_labs,
+        x="timestamp",
+        y="lab_glucose",
+        markers=True,
+        title="FHIR Laboratory Glucose Results",
+        labels={"lab_glucose": "Glucose (mg/dL)"}
+    )
+
+    fig.add_hline(
+        y=126,
+        line_dash="dash",
+        line_color="red",
+        annotation_text="Hyperglycemia threshold"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Laboratory glucose values provide high-confidence reference points and "
+        "are shown alongside wearable trends for clinical context."
+    )
+
 
 # =========================
 # PANEL 4 — CONTEXT
