@@ -218,6 +218,5 @@ for msg in education:
 # =========================
 st.markdown("""
 ---
-*This dashboard help to detect early signs of deterioration.  
-It does not provide diagnoses or replace clinician judgment.*
+*This dashboard help to detect early signs of clinical deterioration*
 """)
